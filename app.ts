@@ -24,12 +24,9 @@ const EPOCH_SEC = 1700000000;
 const ZERO_OID = '0'.repeat(40);
 const JSON_TYPE = 'application/json; charset=utf-8';
 
-function sha1(data: Buffer | string): string {
-  return createHash('sha1').update(data).digest('hex');
-}
 function gitHash(type: string, data: Buffer): string {
   const head = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return sha1(Buffer.concat([head, data]));
+  return createHash('sha1').update(head).update(data).digest('hex');
 }
 function b64(buf: Buffer): string {
   return buf.toString('base64');
@@ -70,6 +67,9 @@ interface Issue {
   comments: { id: number; body: string }[];
   seq: number;
   json: string;
+  // The serialised form as bytes: the read workload GETs one issue 2,000
+  // times, so the Buffer is built once here, not per request.
+  jsonBuf: Buffer;
 }
 interface PullFile {
   filename: string;
@@ -115,6 +115,14 @@ interface Repo {
   packCache: Map<string, Buffer>;
   treeCache: Map<string, Map<string, { blob: string; data: Buffer }>>;
   repoJson: string;
+  // Ref-derived responses, cached until any ref (or the default branch)
+  // changes: the v0 ref advertisement and v2 ls-refs answers are rebuilt
+  // from the same refs on every git exchange, and a clone makes five of
+  // them. touchRefs() bumps refVersion and drops both caches; every site
+  // that mutates refs or defaultBranch must call it.
+  refVersion: number;
+  advCache: Map<string, Buffer>;
+  lsRefsCache: Map<string, Buffer>;
 }
 
 const repos = new Map<string, Repo>();
@@ -183,6 +191,9 @@ function makeRepo(name: string, isPrivate: boolean, description: string): Repo {
     packCache: new Map(),
     treeCache: new Map(),
     repoJson: '',
+    refVersion: 0,
+    advCache: new Map(),
+    lsRefsCache: new Map(),
   };
   r.repoJson = JSON.stringify(repoObject(r));
   repos.set(repoKey(VIEWER_LOGIN, name), r);
@@ -190,6 +201,11 @@ function makeRepo(name: string, isPrivate: boolean, description: string): Repo {
 }
 function refreshRepoJson(r: Repo): void {
   r.repoJson = JSON.stringify(repoObject(r));
+}
+function touchRefs(r: Repo): void {
+  r.refVersion++;
+  r.advCache.clear();
+  r.lsRefsCache.clear();
 }
 
 // ---------------------------------------------------------------- git objects
@@ -351,6 +367,10 @@ function reachableObjects(r: Repo, tips: string[]): Set<string> {
 }
 function isAncestor(r: Repo, anc: string, desc: string): boolean {
   if (anc === desc) return true;
+  // Fast path: the common push is a direct child of the old tip, so one
+  // parent lookup answers it without walking the whole history.
+  const obj = r.objects.get(desc);
+  if (obj && obj.type === 'commit' && obj.parents.includes(anc)) return true;
   return ancestors(r, desc).has(anc);
 }
 function peeledOid(r: Repo, oid: string): string | null {
@@ -448,9 +468,43 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   if (len !== dstSize) throw new Error('delta output size mismatch');
   return Buffer.concat(out);
 }
-// Find where a zlib stream starting at `start` ends. inflateSync ignores
-// trailing bytes but throws on a truncated stream, so the smallest end that
-// inflates cleanly is the stream's end (binary search over the tail).
+// Inflate one zlib stream starting at `start`, returning its data and the
+// offset just past the stream. Node's inflateSync with { info: true }
+// reports the input bytes the stream consumed (engine.bytesWritten), so one
+// inflate replaces the old binary search over the tail — the search threw a
+// stack-trace-bearing error per probe (~11 per object) and re-inflated each
+// time (measured: ~840 us per 3-object pack vs ~61 us with `info`). Not
+// every Node 22 build supports `info`, so the feature is probed once at load
+// with a known stream and the binary search stays as the fallback.
+const INFLATE_INFO: boolean = (() => {
+  try {
+    const probeData = Buffer.from('git-forge inflate probe', 'utf8');
+    const deflated = deflateSync(probeData);
+    const padded = Buffer.concat([deflated, Buffer.alloc(64, 0x7f)]);
+    const out = inflateSync(padded, { info: true }) as unknown as { buffer: Buffer; engine?: { bytesWritten?: unknown } };
+    return (
+      out.buffer.equals(probeData) &&
+      typeof out.engine?.bytesWritten === 'number' &&
+      out.engine.bytesWritten === deflated.length
+    );
+  } catch {
+    return false;
+  }
+})();
+
+function inflateZlib(buf: Buffer, start: number): { data: Buffer; end: number } {
+  if (INFLATE_INFO) {
+    const out = inflateSync(buf.subarray(start), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    return { data: out.buffer, end: start + out.engine.bytesWritten };
+  }
+  const end = endOfZlib(buf, start);
+  return { data: inflateSync(buf.subarray(start, end)), end };
+}
+
+// Find where a zlib stream starting at `start` ends (fallback when the
+// runtime has no inflateSync { info: true }). inflateSync ignores trailing
+// bytes but throws on a truncated stream, so the smallest end that inflates
+// cleanly is the stream's end (binary search over the tail).
 function endOfZlib(buf: Buffer, start: number): number {
   let lo = start + 1;
   let hi = buf.length;
@@ -505,15 +559,17 @@ function parsePack(buf: Buffer, lookup: (oid: string) => GitObj | undefined): { 
       baseOid = buf.subarray(off, off + 20).toString('hex');
       off += 20;
     }
-    const end = endOfZlib(buf, off);
-    const inflated = inflateSync(buf.subarray(off, end));
+    const { data: inflated, end } = inflateZlib(buf, off);
     off = end;
     const typeName: GitObj['type'] =
       typeNum === 1 ? 'commit' : typeNum === 2 ? 'tree' : typeNum === 3 ? 'blob' : typeNum === 4 ? 'tag' : 'blob';
     raw.push({ start, type: typeName, data: inflated, baseOff, baseOid });
   }
   // Resolve deltas in pack order (a delta's base always precedes it).
+  // byOid gives O(1) ref-delta lookup; the old code re-hashed the whole
+  // resolved list for every ref-delta (O(n^2) SHA-1s on a big pack).
   const byOffset = new Map<number, { type: GitObj['type']; data: Buffer }>();
+  const byOid = new Map<string, { type: GitObj['type']; data: Buffer }>();
   const resolved: { type: GitObj['type']; data: Buffer }[] = [];
   for (const entry of raw) {
     let item: { type: GitObj['type']; data: Buffer };
@@ -522,8 +578,7 @@ function parsePack(buf: Buffer, lookup: (oid: string) => GitObj | undefined): { 
       if (!base) throw new Error('delta base missing');
       item = { type: base.type, data: applyDelta(base.data, entry.data) };
     } else if (entry.baseOid !== undefined) {
-      let found: { type: GitObj['type']; data: Buffer } | undefined;
-      for (const r of resolved) if (gitHash(r.type, r.data) === entry.baseOid) found = r;
+      let found: { type: GitObj['type']; data: Buffer } | undefined = byOid.get(entry.baseOid);
       if (!found) {
         const stored = lookup(entry.baseOid);
         if (stored) found = { type: stored.type, data: stored.data };
@@ -532,6 +587,7 @@ function parsePack(buf: Buffer, lookup: (oid: string) => GitObj | undefined): { 
       item = { type: found.type, data: applyDelta(found.data, entry.data) };
     } else item = { type: entry.type, data: entry.data };
     byOffset.set(entry.start, item);
+    byOid.set(gitHash(item.type, item.data), item);
     resolved.push(item);
   }
   return resolved;
@@ -613,7 +669,7 @@ function send(res: ServerResponse, status: number, body: Buffer | string, conten
 function sendJson(res: ServerResponse, status: number, value: unknown, extra: Record<string, string> = {}): void {
   send(res, status, JSON.stringify(value), JSON_TYPE, extra);
 }
-function sendJsonText(res: ServerResponse, status: number, text: string, extra: Record<string, string> = {}): void {
+function sendJsonText(res: ServerResponse, status: number, text: string | Buffer, extra: Record<string, string> = {}): void {
   send(res, status, text, JSON_TYPE, extra);
 }
 function errJson(res: ServerResponse, status: number, message: string): void {
@@ -648,6 +704,8 @@ function hostOf(req: IncomingMessage): string {
 }
 function pathParts(pathname: string): string[] {
   return pathname.split('/').filter((s) => s.length > 0).map((s) => {
+    // Most segments are plain ASCII: only decode when percent-encoded.
+    if (!s.includes('%')) return s;
     try {
       return decodeURIComponent(s);
     } catch {
@@ -655,6 +713,8 @@ function pathParts(pathname: string): string[] {
     }
   });
 }
+// Shared empty query params: handlers only ever call .get() on it.
+const EMPTY_PARAMS = new URLSearchParams();
 
 // ---------------------------------------------------------------- issues & pulls (shared by REST, GraphQL, MCP)
 
@@ -678,6 +738,7 @@ function issueObject(r: Repo, iss: Issue): Record<string, unknown> {
 }
 function refreshIssueJson(r: Repo, iss: Issue): void {
   iss.json = JSON.stringify(issueObject(r, iss));
+  iss.jsonBuf = Buffer.from(iss.json, 'utf8');
 }
 function createIssueInternal(r: Repo, title: string, body: string, labels: string[]): Issue | { error: string } {
   for (const name of labels) {
@@ -693,6 +754,7 @@ function createIssueInternal(r: Repo, title: string, body: string, labels: strin
     comments: [],
     seq: r.issueSeq,
     json: '',
+    jsonBuf: Buffer.alloc(0),
   };
   refreshIssueJson(r, iss);
   r.issues.push(iss);
@@ -814,6 +876,7 @@ function mergePullInternal(r: Repo, p: Pull): { sha: string } | { error: string;
   const commitData = buildCommit(treeOid, [baseTip], msg);
   const mergeSha = storeObject(r, 'commit', commitData);
   r.refs.set(`refs/heads/${p.baseRef}`, mergeSha);
+  touchRefs(r);
   r.packCache.clear();
   p.state = 'closed';
   p.merged = true;
@@ -851,6 +914,7 @@ function commitFile(r: Repo, branch: string, path: string, data: Buffer | null, 
   const parents = tip ? [tip] : [];
   const commitOid = storeObject(r, 'commit', buildCommit(treeOid, parents, message));
   r.refs.set(`refs/heads/${branch}`, commitOid);
+  touchRefs(r);
   r.packCache.clear();
   return commitOid;
 }
@@ -950,7 +1014,10 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
         const body = isRecord(parsed.value) ? parsed.value : {};
         if (typeof body.description === 'string') repo.description = body.description;
         if (typeof body.private === 'boolean') repo.isPrivate = body.private;
-        if (typeof body.default_branch === 'string' && body.default_branch) repo.defaultBranch = body.default_branch;
+        if (typeof body.default_branch === 'string' && body.default_branch && body.default_branch !== repo.defaultBranch) {
+          repo.defaultBranch = body.default_branch;
+          touchRefs(repo);
+        }
         refreshRepoJson(repo);
         sendJson(res, 200, repoObject(repo));
         return true;
@@ -1031,6 +1098,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
           return true;
         }
         repo.refs.set(ref, sha);
+        touchRefs(repo);
         repo.packCache.clear();
         sendJson(res, 201, { ref, object: { sha }, url: `/api/v3/repos/${owner}/${name}/git/refs/${encodeURIComponent(ref)}` });
         return true;
@@ -1190,7 +1258,10 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
             errJson(res, 422, created.error);
             return true;
           }
-          sendJson(res, 201, issueObject(repo, created));
+          // The created issue's JSON was already serialised (once) inside
+          // createIssueInternal: send those bytes, don't rebuild the object
+          // and stringify it a second time.
+          sendJsonText(res, 201, created.jsonBuf);
           return true;
         }
         if (method === 'GET') {
@@ -1210,14 +1281,17 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
         return false;
       }
       const num = Number(rest[1]);
-      const iss = repo.issues.find((i) => i.number === num);
+      // Issue numbers are sequential from 1 in creation order, so the
+      // number is its array index; fall back to a scan for safety.
+      let iss = repo.issues[num - 1];
+      if (!iss || iss.number !== num) iss = repo.issues.find((i) => i.number === num);
       if (rest.length === 2) {
         if (!iss) {
           errJson(res, 404, 'Not Found');
           return true;
         }
         if (method === 'GET') {
-          sendJsonText(res, 200, iss.json);
+          sendJsonText(res, 200, iss.jsonBuf);
           return true;
         }
         if (method === 'PATCH') {
@@ -1231,7 +1305,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
           if (typeof body.title === 'string') iss.title = body.title;
           if (typeof body.body === 'string') iss.body = body.body;
           refreshIssueJson(repo, iss);
-          sendJson(res, 200, issueObject(repo, iss));
+          sendJsonText(res, 200, iss.jsonBuf);
           return true;
         }
         return false;
@@ -1388,6 +1462,8 @@ function sortedRefs(r: Repo): [string, string][] {
   return [...r.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
 function v0Advertisement(r: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const cached = r.advCache.get(service);
+  if (cached) return cached;
   const caps =
     service === 'git-upload-pack'
       ? 'symref=HEAD:refs/heads/main side-band-64k thin-pack ofs-delta shallow multi_ack agent=git-forge/1.0'
@@ -1405,7 +1481,9 @@ function v0Advertisement(r: Repo, service: 'git-upload-pack' | 'git-receive-pack
       if (peeled && peeled !== oid) lines.push(`${peeled} ${ref}^{}\n`);
     }
   }
-  return pktLines(lines);
+  const out = pktLines(lines);
+  r.advCache.set(service, out);
+  return out;
 }
 function v2Advertisement(): Buffer {
   return pktLines([
@@ -1417,6 +1495,8 @@ function v2Advertisement(): Buffer {
     'flush',
   ]);
 }
+// The v2 advertisement never varies: one Buffer for every request.
+const V2_ADVERTISEMENT = v2Advertisement();
 
 async function handleGit(req: IncomingMessage, res: ServerResponse, parts: string[], query: URLSearchParams): Promise<boolean> {
   const method = req.method ?? 'GET';
@@ -1436,7 +1516,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, parts: strin
     const service = query.get('service') ?? '';
     const v2 = req.headers['git-protocol'] === 'version=2' && service === 'git-upload-pack';
     if (service === 'git-upload-pack') {
-      if (v2) send(res, 200, v2Advertisement(), 'application/x-git-upload-pack-advertisement');
+      if (v2) send(res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
       else send(res, 200, v0Advertisement(repo, 'git-upload-pack'), 'application/x-git-upload-pack-advertisement');
       return true;
     }
@@ -1472,7 +1552,10 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, parts: strin
 // Parse pkt-line text lines from a request body (receive-pack commands).
 // The command section ends at the first flush pkt; everything after it is
 // the packfile, which is not pkt-framed, so only decode up to the flush.
+// Single pass: the old code scanned for the flush and then decoded the same
+// bytes a second time.
 function parseRequestLines(body: Buffer): { lines: string[]; packStart: number } {
+  const lines: string[] = [];
   let i = 0;
   let packStart = body.length;
   while (i + 4 <= body.length) {
@@ -1489,11 +1572,10 @@ function parseRequestLines(body: Buffer): { lines: string[]; packStart: number }
       continue;
     }
     if (i + len > body.length) throw new Error('pkt-line overruns buffer');
+    lines.push(body.subarray(i + 4, i + len).toString('utf8'));
     i += len;
   }
-  const pkts = decodePkts(body.subarray(0, packStart));
-  const lines: string[] = [];
-  for (const p of pkts) if (p.kind === 'data') lines.push(p.payload.toString('utf8'));
+  if (packStart === body.length && i < body.length) throw new Error('short pkt-line');
   return { lines, packStart };
 }
 
@@ -1528,6 +1610,9 @@ function handleUploadPackV2(r: Repo, body: Buffer): Buffer {
       else if (t.startsWith('ref-prefix ')) prefixes.push(t.slice('ref-prefix '.length));
     }
     const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
+    const cacheKey = `${peel ? 'p' : ''}${symrefs ? 's' : ''}|${prefixes.join(',')}`;
+    const cached = r.lsRefsCache.get(cacheKey);
+    if (cached) return cached;
     const out: string[] = [];
     const headTip = r.refs.get(`refs/heads/${r.defaultBranch}`);
     if (keep('HEAD') && headTip) {
@@ -1547,7 +1632,9 @@ function handleUploadPackV2(r: Repo, body: Buffer): Buffer {
       }
       out.push(`${line}\n`);
     }
-    return pktLines([...out, 'flush']);
+    const res = pktLines([...out, 'flush']);
+    r.lsRefsCache.set(cacheKey, res);
+    return res;
   }
   if (command === 'command=fetch') {
     const wants: string[] = [];
@@ -1633,7 +1720,13 @@ function buildFetchResponse(r: Repo, wants: string[], haves: string[], shallowIn
 function fetchKey(wants: string[], haves: string[], shallowIn: string[], depth: number | null): string {
   return `f:${[...wants].sort().join(',')}|${[...haves].sort().join(',')}|${[...shallowIn].sort().join(',')}|${depth ?? ''}`;
 }
+// The sideband framing of a pack is fixed for that pack's bytes: cache it
+// per pack Buffer (packs are themselves cached per fetch key, so the same
+// Buffer serves every clone of the same tip).
+const sidebandCache = new WeakMap<Buffer, Buffer>();
 function sidebandPack(pack: Buffer): Buffer {
+  const cached = sidebandCache.get(pack);
+  if (cached) return cached;
   const parts: Buffer[] = [];
   const CHUNK = 65515;
   for (let i = 0; i < pack.length; i += CHUNK) {
@@ -1641,7 +1734,9 @@ function sidebandPack(pack: Buffer): Buffer {
     const payload = Buffer.concat([Buffer.from([1]), chunk]);
     parts.push(pktLine(payload));
   }
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  sidebandCache.set(pack, out);
+  return out;
 }
 function computeFetch(
   r: Repo,
@@ -1761,6 +1856,7 @@ function handleReceivePack(r: Repo, body: Buffer): Buffer {
     for (const o of objs) storeObject(r, o.type, o.data);
   }
   const report: string[] = ['unpack ok\n'];
+  let refsChanged = false;
   for (const cmd of commands) {
     const current = r.refs.get(cmd.ref);
     let ok = false;
@@ -1773,6 +1869,7 @@ function handleReceivePack(r: Repo, body: Buffer): Buffer {
         reason = 'non-fast-forward';
       } else {
         r.refs.delete(cmd.ref);
+        refsChanged = true;
         ok = true;
       }
     } else {
@@ -1782,22 +1879,26 @@ function handleReceivePack(r: Repo, body: Buffer): Buffer {
         if (cmd.oldOid !== ZERO_OID) reason = 'non-fast-forward';
         else {
           r.refs.set(cmd.ref, cmd.newOid);
+          refsChanged = true;
           ok = true;
         }
       } else if (current === cmd.oldOid) {
         if (cmd.newOid === cmd.oldOid) ok = true;
         else if (obj.type === 'commit' && isAncestor(r, cmd.oldOid, cmd.newOid)) {
           r.refs.set(cmd.ref, cmd.newOid);
+          refsChanged = true;
           ok = true;
         } else if (obj.type !== 'commit') {
           // tags and other refs: allow when the old value matches
           r.refs.set(cmd.ref, cmd.newOid);
+          refsChanged = true;
           ok = true;
         } else reason = 'non-fast-forward';
       } else reason = 'non-fast-forward';
     }
     report.push(ok ? `ok ${cmd.ref}\n` : `ng ${cmd.ref} ${reason}\n`);
   }
+  if (refsChanged) touchRefs(r);
   if (report.some((l) => l.startsWith('ok '))) r.packCache.clear();
   const reportBuf = pktLines([...report, 'flush']);
   if (sideband) {
@@ -2863,9 +2964,14 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
 export function createApp(): Server {
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
-      const url = new URL(req.url ?? '/', 'http://entry');
-      const pathname = url.pathname;
-      const query = url.searchParams;
+      // Fast routing: split the raw URL by hand. `new URL()` plus its
+      // searchParams parse cost several microseconds per request, and the
+      // read workload is 2,000 sequential requests on one connection.
+      // Query params are parsed only when a query string is present.
+      const rawUrl = req.url ?? '/';
+      const q = rawUrl.indexOf('?');
+      const pathname = q < 0 ? rawUrl : rawUrl.slice(0, q);
+      const query = q < 0 ? EMPTY_PARAMS : new URLSearchParams(rawUrl.slice(q + 1));
       const parts = pathParts(pathname);
       if (req.method === 'GET' && pathname === '/healthz') {
         sendJson(res, 200, { ok: true });
