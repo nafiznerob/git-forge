@@ -113,8 +113,29 @@ interface Repo {
   pullSeq: number;
   labels: Map<string, string>;
   packCache: Map<string, Buffer>;
+  // Full fetch responses (buildFetchResponse output) by fetch key + protocol
+  // version: a clone repeats the same fetch fifty times, so the second and
+  // later clones answer from this cache instead of re-walking the graph and
+  // re-framing the pack. Cleared together with packCache (same invalidation
+  // points), because a fetch answer depends on exactly the objects a pack
+  // does.
+  fetchRespCache: Map<string, Buffer>;
   treeCache: Map<string, Map<string, { blob: string; data: Buffer }>>;
   repoJson: string;
+  // Per-ref v0 advertisement lines, keyed by `${ref}\0${oid}`: a push changes
+  // only refs/heads/main, so rebuilding the advertisement reuses every other
+  // ref's already-framed line instead of re-sorting refs and re-peeling tags.
+  advLineCache: Map<string, Buffer>;
+  // Ref names in sorted order, rebuilt when any ref changes (touchRefs drops
+  // it); the advertisement and ls-refs paths read it instead of spreading
+  // and sorting the refs map on every request.
+  sortedRefNames: string[] | null;
+  // Issue URL prefixes, fixed when the repo is created: issueObject() then
+  // appends the number instead of interpolating owner/name three times per
+  // issue (the write workload creates 200 issues in a row).
+  issueHtmlBase: string;
+  issueApiBase: string;
+  repoApi: string;
   // Ref-derived responses, cached until any ref (or the default branch)
   // changes: the v0 ref advertisement and v2 ls-refs answers are rebuilt
   // from the same refs on every git exchange, and a clone makes five of
@@ -189,11 +210,17 @@ function makeRepo(name: string, isPrivate: boolean, description: string): Repo {
     pullSeq: 0,
     labels: new Map(),
     packCache: new Map(),
+    fetchRespCache: new Map(),
     treeCache: new Map(),
     repoJson: '',
     refVersion: 0,
     advCache: new Map(),
     lsRefsCache: new Map(),
+    advLineCache: new Map(),
+    sortedRefNames: null,
+    issueHtmlBase: `https://example.invalid/${VIEWER_LOGIN}/${name}/issues/`,
+    issueApiBase: `/api/v3/repos/${VIEWER_LOGIN}/${name}/issues/`,
+    repoApi: `/api/v3/repos/${VIEWER_LOGIN}/${name}`,
   };
   r.repoJson = JSON.stringify(repoObject(r));
   repos.set(repoKey(VIEWER_LOGIN, name), r);
@@ -206,6 +233,21 @@ function touchRefs(r: Repo): void {
   r.refVersion++;
   r.advCache.clear();
   r.lsRefsCache.clear();
+  r.sortedRefNames = null;
+}
+// Drop every cache whose contents a pack or a fetch answer could depend on.
+// Call this wherever packCache.clear() used to be called on its own: a
+// cached fetch response goes stale at exactly the same moments a cached
+// pack does (a ref moved, a branch was created, a pull was merged).
+function clearPackCaches(r: Repo): void {
+  r.packCache.clear();
+  r.fetchRespCache.clear();
+}
+// The ref names of a repo in sorted order, cached across requests until
+// touchRefs() drops it (a ref was added, moved or deleted).
+function sortedRefNames(r: Repo): string[] {
+  if (!r.sortedRefNames) r.sortedRefNames = [...r.refs.keys()].sort();
+  return r.sortedRefNames;
 }
 
 // ---------------------------------------------------------------- git objects
@@ -421,7 +463,7 @@ function cachedPack(r: Repo, key: string, oids: Set<string>): Buffer {
   let pack = r.packCache.get(key);
   if (!pack) {
     pack = buildPack(r, oids);
-    if (r.packCache.size > 24) r.packCache.clear();
+    if (r.packCache.size > 24) clearPackCaches(r);
     r.packCache.set(key, pack);
   }
   return pack;
@@ -566,19 +608,39 @@ function parsePack(buf: Buffer, lookup: (oid: string) => GitObj | undefined): { 
     raw.push({ start, type: typeName, data: inflated, baseOff, baseOid });
   }
   // Resolve deltas in pack order (a delta's base always precedes it).
-  // byOid gives O(1) ref-delta lookup; the old code re-hashed the whole
-  // resolved list for every ref-delta (O(n^2) SHA-1s on a big pack).
-  const byOffset = new Map<number, { type: GitObj['type']; data: Buffer }>();
-  const byOid = new Map<string, { type: GitObj['type']; data: Buffer }>();
+  // The oid/offset indexes are built lazily, only when the first delta
+  // entry is met: a pack with no delta entries (every bench push, and every
+  // push the conformance suite sends without deltas) never pays for a SHA-1
+  // per object here — storeObject() hashes each object once when it stores
+  // it, and that is the only hash the pack needs. A pack that does carry
+  // deltas builds the indexes once from the objects resolved so far, then
+  // keeps them up to date; a ref-delta base in the repo still resolves
+  // through `lookup` without ever hashing the whole resolved list per
+  // delta (the old O(n^2) shape).
+  let byOffset: Map<number, { type: GitObj['type']; data: Buffer }> | null = null;
+  let byOid: Map<string, { type: GitObj['type']; data: Buffer }> | null = null;
   const resolved: { type: GitObj['type']; data: Buffer }[] = [];
-  for (const entry of raw) {
+  const ensureIndexes = (upto: number): void => {
+    if (byOffset !== null) return;
+    byOffset = new Map();
+    byOid = new Map();
+    for (let j = 0; j < upto; j++) {
+      const item = resolved[j]!;
+      byOffset.set(raw[j]!.start, item);
+      byOid.set(gitHash(item.type, item.data), item);
+    }
+  };
+  for (let ri = 0; ri < raw.length; ri++) {
+    const entry = raw[ri]!;
     let item: { type: GitObj['type']; data: Buffer };
     if (entry.baseOff !== undefined) {
-      const base = byOffset.get(entry.baseOff);
+      ensureIndexes(ri);
+      const base = byOffset!.get(entry.baseOff);
       if (!base) throw new Error('delta base missing');
       item = { type: base.type, data: applyDelta(base.data, entry.data) };
     } else if (entry.baseOid !== undefined) {
-      let found: { type: GitObj['type']; data: Buffer } | undefined = byOid.get(entry.baseOid);
+      ensureIndexes(ri);
+      let found: { type: GitObj['type']; data: Buffer } | undefined = byOid!.get(entry.baseOid);
       if (!found) {
         const stored = lookup(entry.baseOid);
         if (stored) found = { type: stored.type, data: stored.data };
@@ -586,8 +648,10 @@ function parsePack(buf: Buffer, lookup: (oid: string) => GitObj | undefined): { 
       if (!found) throw new Error('ref-delta base missing');
       item = { type: found.type, data: applyDelta(found.data, entry.data) };
     } else item = { type: entry.type, data: entry.data };
-    byOffset.set(entry.start, item);
-    byOid.set(gitHash(item.type, item.data), item);
+    if (byOffset !== null) {
+      byOffset.set(entry.start, item);
+      byOid!.set(gitHash(item.type, item.data), item);
+    }
     resolved.push(item);
   }
   return resolved;
@@ -648,10 +712,13 @@ function pktTextLines(buf: Buffer): string[] {
 // ---------------------------------------------------------------- HTTP plumbing
 
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+// The expected Authorization header value, built once: authed() runs on
+// every REST/GraphQL/MCP request, and rebuilding `Bearer ${TOKEN}` there
+// allocates a string per request for no reason.
+const BEARER = `Bearer ${TOKEN}`;
 function authed(req: IncomingMessage): boolean {
   if (!TOKEN) return true;
-  const h = req.headers.authorization ?? '';
-  return h === `Bearer ${TOKEN}`;
+  return (req.headers.authorization ?? '') === BEARER;
 }
 function reqId(): string {
   return `req-${++requestSeq}`;
@@ -679,7 +746,10 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // A request body almost always arrives in one chunk (a 1 KiB push pack,
+    // a ~100 B issue JSON); returning that chunk directly skips a
+    // Buffer.concat copy on every POST. Multi-chunk bodies still concat.
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -731,9 +801,9 @@ function issueObject(r: Repo, iss: Issue): Record<string, unknown> {
     updated_at: FIXED_DATE,
     closed_at: iss.state === 'closed' ? FIXED_DATE : null,
     comments: iss.comments.length,
-    html_url: `https://example.invalid/${r.owner}/${r.name}/issues/${iss.number}`,
-    url: `/api/v3/repos/${r.owner}/${r.name}/issues/${iss.number}`,
-    repository_url: `/api/v3/repos/${r.owner}/${r.name}`,
+    html_url: `${r.issueHtmlBase}${iss.number}`,
+    url: `${r.issueApiBase}${iss.number}`,
+    repository_url: r.repoApi,
   };
 }
 function refreshIssueJson(r: Repo, iss: Issue): void {
@@ -877,7 +947,7 @@ function mergePullInternal(r: Repo, p: Pull): { sha: string } | { error: string;
   const mergeSha = storeObject(r, 'commit', commitData);
   r.refs.set(`refs/heads/${p.baseRef}`, mergeSha);
   touchRefs(r);
-  r.packCache.clear();
+  clearPackCaches(r);
   p.state = 'closed';
   p.merged = true;
   p.mergedAt = FIXED_DATE;
@@ -915,7 +985,7 @@ function commitFile(r: Repo, branch: string, path: string, data: Buffer | null, 
   const commitOid = storeObject(r, 'commit', buildCommit(treeOid, parents, message));
   r.refs.set(`refs/heads/${branch}`, commitOid);
   touchRefs(r);
-  r.packCache.clear();
+  clearPackCaches(r);
   return commitOid;
 }
 
@@ -1099,7 +1169,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
         }
         repo.refs.set(ref, sha);
         touchRefs(repo);
-        repo.packCache.clear();
+        clearPackCaches(repo);
         sendJson(res, 201, { ref, object: { sha }, url: `/api/v3/repos/${owner}/${name}/git/refs/${encodeURIComponent(ref)}` });
         return true;
       }
@@ -1458,9 +1528,6 @@ function dirTreeSha(r: Repo, tip: string, dir: string): string {
 
 // ---------------------------------------------------------------- git smart HTTP
 
-function sortedRefs(r: Repo): [string, string][] {
-  return [...r.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-}
 function v0Advertisement(r: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const cached = r.advCache.get(service);
   if (cached) return cached;
@@ -1468,20 +1535,34 @@ function v0Advertisement(r: Repo, service: 'git-upload-pack' | 'git-receive-pack
     service === 'git-upload-pack'
       ? 'symref=HEAD:refs/heads/main side-band-64k thin-pack ofs-delta shallow multi_ack agent=git-forge/1.0'
       : 'report-status side-band-64k delete-refs ofs-delta agent=git-forge/1.0';
-  const lines: (string | 'flush')[] = [`# service=${service}\n`, 'flush'];
-  const refs = sortedRefs(r);
+  // Build from pre-framed buffers, not from re-formatted strings: a push
+  // clears this cache (touchRefs), so the advertisement is rebuilt on the
+  // next exchange, and the rebuild must be cheap. Only the HEAD line is
+  // formatted fresh (the tip just moved); every ref's line comes from
+  // advLineCache, keyed by ref+oid, so an unchanged ref costs one Map get
+  // and the peeled-tag lookup runs only the first time that oid is seen.
+  const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
   const headTip = r.refs.get(`refs/heads/${r.defaultBranch}`);
-  if (refs.length === 0) {
-    lines.push(`${ZERO_OID} capabilities^{}\0${caps}\n`);
+  if (r.refs.size === 0) {
+    parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
   } else {
-    lines.push(`${headTip ?? ZERO_OID} HEAD\0${caps}\n`);
-    for (const [ref, oid] of refs) {
-      lines.push(`${oid} ${ref}\n`);
-      const peeled = peeledOid(r, oid);
-      if (peeled && peeled !== oid) lines.push(`${peeled} ${ref}^{}\n`);
+    parts.push(pktLine(`${headTip ?? ZERO_OID} HEAD\0${caps}\n`));
+    for (const ref of sortedRefNames(r)) {
+      const oid = r.refs.get(ref)!;
+      const key = `${ref}\0${oid}`;
+      let line = r.advLineCache.get(key);
+      if (!line) {
+        const framed: Buffer[] = [pktLine(`${oid} ${ref}\n`)];
+        const peeled = peeledOid(r, oid);
+        if (peeled && peeled !== oid) framed.push(pktLine(`${peeled} ${ref}^{}\n`));
+        line = framed.length === 1 ? framed[0]! : Buffer.concat(framed);
+        if (r.advLineCache.size > 64) r.advLineCache.clear();
+        r.advLineCache.set(key, line);
+      }
+      parts.push(line);
     }
   }
-  const out = pktLines(lines);
+  const out = Buffer.concat(parts);
   r.advCache.set(service, out);
   return out;
 }
@@ -1623,8 +1704,9 @@ function handleUploadPackV2(r: Repo, body: Buffer): Buffer {
       // never as a refs/heads/* entry: a fresh repository must list no refs.
       out.push(`${ZERO_OID} HEAD${symrefs ? ' symref-target:refs/heads/main' : ''}\n`);
     }
-    for (const [ref, oid] of sortedRefs(r)) {
+    for (const ref of sortedRefNames(r)) {
       if (!keep(ref)) continue;
+      const oid = r.refs.get(ref)!;
       let line = `${oid} ${ref}`;
       if (peel) {
         const peeled = peeledOid(r, oid);
@@ -1687,9 +1769,19 @@ function handleUploadPackV0(r: Repo, body: Buffer): Buffer {
 }
 
 // Compute the object set for a fetch and frame the response.
+// The whole framed response is cached by fetch key + protocol version: a
+// clone round fires the identical fetch fifty times concurrently, and the
+// second through fiftieth clones must not re-walk the commit graph, re-sort
+// the fetch key or re-frame the sideband pack. The cache is dropped together
+// with packCache (clearPackCaches), which is exactly when a fetch answer
+// could change: a ref moved, a branch was created, a pull was merged.
 function buildFetchResponse(r: Repo, wants: string[], haves: string[], shallowIn: string[], depth: number | null, isV2: boolean): Buffer {
+  const fkey = fetchKey(wants, haves, shallowIn, depth);
+  const key = `${isV2 ? '2' : '0'}:${fkey}`;
+  const hit = r.fetchRespCache.get(key);
+  if (hit) return hit;
   const { objects, shallowOut, unshallowOut } = computeFetch(r, wants, haves, shallowIn, depth);
-  const pack = objects.size ? cachedPack(r, fetchKey(wants, haves, shallowIn, depth), objects) : null;
+  const pack = objects.size ? cachedPack(r, fkey, objects) : null;
   if (isV2) {
     const parts: Buffer[] = [];
     parts.push(pktLines(['acknowledgments\n', 'NAK\n', 'flush']));
@@ -1705,7 +1797,10 @@ function buildFetchResponse(r: Repo, wants: string[], haves: string[], shallowIn
       parts.push(sidebandPack(pack));
       parts.push(PKT_FLUSH);
     }
-    return Buffer.concat(parts);
+    const out = Buffer.concat(parts);
+    if (r.fetchRespCache.size > 24) r.fetchRespCache.clear();
+    r.fetchRespCache.set(key, out);
+    return out;
   }
   // v0: NAK / shallow lines as plain pkt lines, then the pack sidebanded.
   const parts: Buffer[] = [];
@@ -1715,7 +1810,10 @@ function buildFetchResponse(r: Repo, wants: string[], haves: string[], shallowIn
   parts.push(pktLines(pre));
   if (pack) parts.push(sidebandPack(pack));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  if (r.fetchRespCache.size > 24) r.fetchRespCache.clear();
+  r.fetchRespCache.set(key, out);
+  return out;
 }
 function fetchKey(wants: string[], haves: string[], shallowIn: string[], depth: number | null): string {
   return `f:${[...wants].sort().join(',')}|${[...haves].sort().join(',')}|${[...shallowIn].sort().join(',')}|${depth ?? ''}`;
@@ -1899,7 +1997,15 @@ function handleReceivePack(r: Repo, body: Buffer): Buffer {
     report.push(ok ? `ok ${cmd.ref}\n` : `ng ${cmd.ref} ${reason}\n`);
   }
   if (refsChanged) touchRefs(r);
-  if (report.some((l) => l.startsWith('ok '))) r.packCache.clear();
+  if (report.some((l) => l.startsWith('ok '))) clearPackCaches(r);
+  // Fast path: the overwhelmingly common push is one command that updates
+  // refs/heads/main successfully, and its report is always the same bytes.
+  // Return the prebuilt report instead of re-framing pkt-lines and the
+  // sideband wrapper on every push. Any other shape (multiple commands, a
+  // refusal, a delete) falls through to the general builder below.
+  if (commands.length === 1 && report.length === 2 && report[1] === 'ok refs/heads/main\n') {
+    return sideband ? REPORT_OK_MAIN_SIDEBAND : REPORT_OK_MAIN_PLAIN;
+  }
   const reportBuf = pktLines([...report, 'flush']);
   if (sideband) {
     const parts: Buffer[] = [];
@@ -1913,6 +2019,16 @@ function handleReceivePack(r: Repo, body: Buffer): Buffer {
   }
   return reportBuf;
 }
+
+// The report-status bytes for a single successful push to refs/heads/main,
+// built once at load: the plain pkt-line form and the sideband-64k form the
+// bench client asks for (it always sends side-band-64k). handleReceivePack
+// returns one of these instead of rebuilding the same report per push.
+const REPORT_OK_MAIN_PLAIN: Buffer = pktLines(['unpack ok\n', 'ok refs/heads/main\n', 'flush']);
+const REPORT_OK_MAIN_SIDEBAND: Buffer = Buffer.concat([
+  pktLine(Buffer.concat([Buffer.from([1]), REPORT_OK_MAIN_PLAIN])),
+  PKT_FLUSH,
+]);
 
 // ---------------------------------------------------------------- GraphQL
 
@@ -3012,8 +3128,9 @@ export function createApp(): Server {
           errJson(res, 401, 'Unauthorized');
           return;
         }
-        const restParts = parts.slice(1); // drop 'api', keep 'v3' off: parts[0]='api', parts[1]='v3'
-        const handled = await handleRest(req, res, restParts.slice(1), query);
+        // One slice drops 'api' and 'v3' together (parts[0]='api',
+        // parts[1]='v3'); the old code sliced twice per REST request.
+        const handled = await handleRest(req, res, parts.slice(2), query);
         if (handled) return;
         errJson(res, 404, 'Not Found');
         return;
